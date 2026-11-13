@@ -8,6 +8,10 @@ Built for the Cloud Computing lab of the MLOps course at Northeastern University
 
 ## Architecture
 
+```
+train.py  ->  model/model.joblib  ->  FastAPI app  ->  Docker image  ->  Artifact Registry  ->  Cloud Run
+```
+
 | Component | Choice |
 |---|---|
 | Model | scikit-learn RandomForestClassifier |
@@ -102,6 +106,21 @@ Example response:
 Invalid inputs, such as negative RPM or an unknown product type, return a 422 validation error instead of reaching the model.
 
 ## Project structure
+
+```
+app/
+  __init__.py
+  features.py      shared feature engineering (training and serving)
+  main.py          FastAPI app
+model/
+  model.joblib     trained model
+  metrics.json     test metrics served by /model-info
+train.py           training script
+Dockerfile
+requirements.txt
+.dockerignore
+.gcloudignore
+```
 
 The `data/` folder is not committed. Download the dataset as described below.
 
