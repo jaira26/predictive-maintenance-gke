@@ -28,7 +28,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Predictive Maintenance API",
     description="Predicts machine failure from sensor readings (AI4I 2020 dataset).",
-    version="1.1.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -49,13 +49,13 @@ class Prediction(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": "model" in state}
+    return {"status": "ok", "model_loaded": "model" in state, "version": "2.0.0"}
 
 
 @app.get("/model-info")
 def model_info():
     return {
-        "model": "RandomForestClassifier",
+        "version": "2.0.0", "model": "RandomForestClassifier",
         "dataset": "AI4I 2020 Predictive Maintenance",
         "features": "raw sensors + power, strain, temperature difference",
         "metrics": state.get("metrics", {}),

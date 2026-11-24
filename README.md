@@ -1,193 +1,143 @@
-﻿# Predictive Maintenance API on Google Cloud Run
+﻿# Predictive Maintenance API on Google Kubernetes Engine
 
-A machine failure prediction service trained on industrial sensor data, served with FastAPI, containerized with Docker, and deployed serverless on Google Cloud Run.
+The predictive maintenance model from my [Cloud Run lab](https://github.com/jaira26/predictive-maintenance-cloudrun), redeployed on Google Kubernetes Engine (GKE) Autopilot with health probes, zero-downtime rolling updates, rollback, and CPU-based autoscaling.
 
-**Live API docs:** https://model-api-633970234530.us-east1.run.app/docs
+Built for the Kubernetes lab of the MLOps course at Northeastern University. It reuses the exact container image from the Cloud Run lab (Artifact Registry), so the comparison between the two platforms is apples to apples.
 
-Built for the Cloud Computing lab of the MLOps course at Northeastern University (labs based on the course's GCP_Labs / Cloud_Runner_Labs). It builds on my earlier labs in the same course: CI/CD with GitHub Actions, Docker, and FastAPI.
+## What this lab adds
+
+- **Deployment** with 2 replicas, readiness and liveness probes on `/health`, and fixed resource requests and limits
+- **LoadBalancer Service** exposing the API on port 80
+- **Horizontal Pod Autoscaler** scaling between 2 and 4 replicas at 60% CPU
+- **Zero-downtime rolling update** from v1 to v2, plus a rollback
+- **In-cluster load test** demonstrating scale-up and scale-down
+- **Cloud Run vs GKE comparison** based on running the same image on both
 
 ## Architecture
 
-```
-train.py  ->  model/model.joblib  ->  FastAPI app  ->  Docker image  ->  Artifact Registry  ->  Cloud Run
-```
+~~~
+Artifact Registry (model-api:v1, v2)
+        |
+GKE Autopilot cluster (us-east1)
+        |
+Deployment: model-api (2-4 pods, probes on /health)
+        |
+Service: LoadBalancer (port 80 -> container 8080)
+        |
+HPA: scales on CPU (target 60%)
+~~~
 
-| Component | Choice |
+## The model
+
+A random forest predicting machine failure from sensor readings (AI4I 2020 dataset), with physics-based engineered features (power, strain, temperature difference). Failure-class results: precision 0.95, recall 0.82, F1 0.88. Full details on the model, features, and API are in the [Cloud Run repo](https://github.com/jaira26/predictive-maintenance-cloudrun).
+
+Endpoints: `GET /health`, `GET /model-info`, `POST /predict`, `GET /docs`.
+
+## Kubernetes manifests
+
+| File | Purpose |
 |---|---|
-| Model | scikit-learn RandomForestClassifier |
-| Serving | FastAPI + Uvicorn, Pydantic input validation |
-| Container | python:3.13-slim |
-| Registry | Google Artifact Registry (us-east1) |
-| Hosting | Google Cloud Run (serverless, scales to zero) |
+| `k8s/deployment.yaml` | 2 replicas, rolling update strategy, probes, resources |
+| `k8s/service.yaml` | External LoadBalancer |
+| `k8s/hpa.yaml` | CPU autoscaling, 2 to 4 replicas |
+| `loadtest/load-generator.yaml` | In-cluster load test pod (kept separate so it never deploys by accident) |
 
-## Changes from the original lab
+Key settings:
 
-- **New dataset and problem:** binary machine failure prediction on the AI4I 2020 Predictive Maintenance dataset, instead of the lab's sample model.
-- **Physics-based feature engineering** that measurably improved the model (see Results).
-- **Shared feature module** used by both training and serving to prevent training-serving skew.
-- **Production-style API:** health check, model info endpoint with live metrics, validated inputs, model loaded once at startup.
-- **Tested image deployed as-is:** the image was built and verified locally, then pushed unchanged to Artifact Registry.
-
-## Dataset
-
-[AI4I 2020 Predictive Maintenance Dataset](https://archive.ics.uci.edu/dataset/601/ai4i+2020+predictive+maintenance+dataset) (UCI Machine Learning Repository): 10,000 synthetic records of milling machine sensor readings with a binary `Machine failure` label.
-
-Inputs: product type (L/M/H), air temperature, process temperature, rotational speed, torque, and tool wear.
-
-Failures are rare (about 3.4% of rows), so accuracy is misleading. A model that always predicts "no failure" scores about 97% accuracy. This project reports **recall and F1 on the failure class** instead, and trains with `class_weight="balanced"`.
-
-The individual failure mode columns (TWF, HDF, PWF, OSF, RNF) are **excluded from training** because they directly encode the label and would leak it.
-
-## Feature engineering
-
-The dataset's failure labels are generated from physical rules, such as overstrain when torque times tool wear exceeds a threshold, or power failure when mechanical power leaves a safe range. A random forest working on raw columns has to approximate these products with many axis-aligned splits, which makes it unreliable in sparse regions of the data.
-
-Three engineered features encode those mechanisms directly:
-
-| Feature | Definition | Failure mechanism |
-|---|---|---|
-| `power_w` | torque x rotational speed x 2 x pi / 60 | Power failure |
-| `strain` | torque x tool wear | Overstrain failure |
-| `temp_diff_k` | process temperature - air temperature | Heat dissipation failure |
-
-These are computed in `app/features.py`, which both `train.py` and the API import. Serving can never compute features differently from training.
+- **Readiness probe:** a pod receives no traffic until `/health` responds. On first deploy, pods showed `Running 0/1` for about 30 seconds before becoming `1/1` and receiving traffic.
+- **Liveness probe:** Kubernetes restarts a pod if `/health` stops responding.
+- **`maxUnavailable: 0`, `maxSurge: 1`:** during updates, a new pod must be ready before an old one is removed.
+- **Requests equal to limits (250m CPU, 512Mi):** Autopilot bills on requests, so this keeps cost predictable.
 
 ## Results
 
-Test set: 2,000 rows (stratified 80/20 split), 68 failures.
+### Rolling update (v1 to v2)
 
-| Model | Precision (failure) | Recall (failure) | F1 (failure) |
-|---|---|---|---|
-| Raw features only | 0.77 | 0.72 | 0.74 |
-| Raw + engineered features | **0.95** | **0.82** | **0.88** |
+v2 adds a `version` field to `/health` and `/model-info`. A monitor polled `/health` twice per second during the rollout. Traffic switched from v1 to v2 with no failed requests: the monitor never returned an error. The rollout log confirms the order: one new replica came up before any old replica terminated.
 
-**Model probing.** Beyond aggregate metrics, I tested the model on a high-stress input (type L, torque 65 Nm, tool wear 230 min, 1551 rpm) that should fail under the dataset's overstrain and power rules:
+![Rolling update](docs/rollout.png)
 
-| Model | Failure probability | Prediction |
+### Rollback
+
+`kubectl rollout undo` reverted to v1 with no failed requests, without rebuilding anything. The manifest was then re-applied to return to v2, so the cluster matches the repo.
+
+![Rollback](docs/rollback.png)
+
+### Autoscaling
+
+An in-cluster load generator ran 8 parallel request loops against `/predict` through the Service's internal DNS name.
+
+| CPU (target 60%) | Replicas | What happened |
 |---|---|---|
-| Raw features only | 0.485 | No failure (wrong) |
-| Raw + engineered features | 0.935 | Failure (correct) |
+| 1% | 2 | Idle baseline |
+| 64% | 2 | No scaling: within the HPA's 10% tolerance band |
+| 70% | 3 | First scale-up |
+| 67% | 4 | Second scale-up, reached maxReplicas |
+| 1% (load stopped) | 4 | Held during the scale-down stabilization window |
+| 1% | 3, then 2 | Stepped down to minReplicas about 5 minutes after load stopped |
 
-The baseline model's aggregate metrics looked reasonable, but probing exposed this miss. The engineered features fixed it.
+![HPA scale-up](docs/hpa-scale-up.png)
+![HPA scale-down](docs/hpa-scale-down.png)
 
-**Deployment verification.** The same request returns identical predictions from the local Uvicorn server, the local Docker container, and the live Cloud Run service.
+Two behaviors worth noting. The HPA did not react the instant CPU crossed 60%: its default 10% tolerance prevents scaling on small fluctuations. And scale-down is deliberately slower than scale-up, so the deployment does not flap if traffic returns.
 
-## API
+Load test limitation: CPU stayed near 67% even at 4 replicas, likely because the single load generator pod (250m CPU) was itself the bottleneck. A distributed load test would push the service harder.
 
-| Method | Endpoint | Description |
+## Cloud Run vs GKE
+
+Same image, same model, two platforms:
+
+| | Cloud Run | GKE Autopilot |
 |---|---|---|
-| GET | `/health` | Liveness check, confirms the model is loaded |
-| GET | `/model-info` | Model type, dataset, features, and test metrics |
-| POST | `/predict` | Returns failure prediction and probability |
-| GET | `/docs` | Interactive Swagger UI |
+| Scaling | Request-based, scales to zero | HPA on CPU, minimum 2 pods |
+| Idle cost | Zero | Pods and load balancer billed continuously |
+| Cold starts | Yes, after idle periods | No, minimum replicas stay warm |
+| Deploy effort | One command | Manifests for deployment, service, autoscaler |
+| Control | Limited | Full: probes, rollout strategy, resources, scheduling |
+| Rollback | Shift traffic to a previous revision | `kubectl rollout undo` |
+| HTTPS | Automatic | Plain HTTP unless an Ingress and certificate are added |
 
-Example request:
+**When to use which:** Cloud Run fits a single stateless service with spiky or low traffic, where scale-to-zero and zero operations matter most. GKE fits when you run many services together, have steady traffic, or need control over rollouts, probes, scheduling, or networking.
 
-```json
-{
-  "type": "L",
-  "air_temperature_k": 298.1,
-  "process_temperature_k": 308.6,
-  "rotational_speed_rpm": 1551,
-  "torque_nm": 65,
-  "tool_wear_min": 230
-}
-```
+## Reproduce
 
-Example response:
+Prerequisites: gcloud CLI with `kubectl` and `gke-gcloud-auth-plugin`, a GCP project with billing, and the image in Artifact Registry (see the Cloud Run repo).
 
-```json
-{
-  "failure": true,
-  "failure_probability": 0.935
-}
-```
+~~~
+gcloud services enable container.googleapis.com
+gcloud container clusters create-auto pm-cluster --region us-east1
+gcloud container clusters get-credentials pm-cluster --region us-east1
 
-Invalid inputs, such as negative RPM or an unknown product type, return a 422 validation error instead of reaching the model.
+kubectl apply -f k8s/
+kubectl get pods
+kubectl get svc model-api
+~~~
 
-## Project structure
+Rolling update and rollback:
 
-```
-app/
-  __init__.py
-  features.py      shared feature engineering (training and serving)
-  main.py          FastAPI app
-model/
-  model.joblib     trained model
-  metrics.json     test metrics served by /model-info
-train.py           training script
-Dockerfile
-requirements.txt
-.dockerignore
-.gcloudignore
-```
+~~~
+kubectl apply -f k8s/deployment.yaml
+kubectl rollout status deployment/model-api
+kubectl rollout history deployment/model-api
+kubectl rollout undo deployment/model-api
+~~~
 
-The `data/` folder is not committed. Download the dataset as described below.
+Load test:
 
-## Run locally
+~~~
+kubectl apply -f loadtest/load-generator.yaml
+kubectl get hpa model-api -w
+kubectl delete pod load-generator
+~~~
 
-```bash
-python -m venv venv
-venv\Scripts\Activate.ps1          # Windows PowerShell
-# source venv/bin/activate         # macOS / Linux
-pip install -r requirements.txt
-```
+Cleanup (the cluster bills while it exists):
 
-Download the data into `data/ai4i2020.csv` from the UCI page linked above, then:
+~~~
+kubectl delete -f k8s/
+gcloud container clusters delete pm-cluster --region us-east1
+~~~
 
-```bash
-python train.py
-uvicorn app.main:app --port 8080
-```
-
-Open http://localhost:8080/docs.
-
-## Run with Docker
-
-```bash
-docker build -t model-api .
-docker run --rm -p 8080:8080 model-api
-```
-
-## Deploy to Cloud Run
-
-One-time setup:
-
-```bash
-gcloud config set project YOUR_PROJECT_ID
-gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com
-gcloud artifacts repositories create mlops-repo --repository-format=docker --location=us-east1
-gcloud auth configure-docker us-east1-docker.pkg.dev
-```
-
-Push the tested image and deploy:
-
-```bash
-docker tag model-api us-east1-docker.pkg.dev/YOUR_PROJECT_ID/mlops-repo/model-api:v1
-docker push us-east1-docker.pkg.dev/YOUR_PROJECT_ID/mlops-repo/model-api:v1
-
-gcloud run deploy model-api --image us-east1-docker.pkg.dev/YOUR_PROJECT_ID/mlops-repo/model-api:v1 --region us-east1 --allow-unauthenticated --memory 1Gi --max-instances 2
-```
-
-## Design decisions
-
-- **Model loaded once at startup** through FastAPI's `lifespan` handler, not per request. On Cloud Run, cold starts are already the main latency cost.
-- **Port read from `$PORT`**, which Cloud Run sets at runtime.
-- **Shell-form `CMD` with `exec`.** Shell form is needed so `${PORT}` expands. `exec` replaces the shell with Uvicorn so shutdown signals reach the app. This is why Docker's `JSONArgsRecommended` warning is safe to ignore here.
-- **Python version pinned to match training (3.13).** Pickled scikit-learn models are not guaranteed to load across library or Python versions, so the container mirrors the training environment exactly via `pip freeze`.
-- **Cost controls.** `--max-instances 2` caps scaling. Cloud Run scales to zero when idle, so the service costs nothing between requests. The first request after idle time may take a few seconds (cold start).
-
-## Limitations
-
-- **Some failures are unpredictable by design.** AI4I includes random failures with no sensor signal and tool wear failures assigned randomly within a wear window. No model can fully catch these, which limits achievable recall.
-- **Probabilities are not calibrated.** Random forest probabilities are the share of trees voting "failure," not true probabilities. Calibration would be needed before using them for risk decisions.
-- **Default 0.5 threshold.** For maintenance use, missing a failure usually costs more than a false alarm, so the threshold should be tuned on a validation set.
-- **Model baked into the image.** Updating the model requires a rebuild and redeploy. A model registry or Cloud Storage would decouple model versions from code.
-
-## Next steps
-
-- GitHub Actions workflow to build and deploy on every push to `main`, using Workload Identity Federation instead of service account keys.
-- Deploy the same image to Google Kubernetes Engine and compare it with Cloud Run on scaling, cost, and operational effort.
+The cluster has been deleted after the lab to stop billing, so there is no live endpoint for this repo. The [Cloud Run deployment](https://model-api-633970234530.us-east1.run.app/docs) of the same model remains live.
 
 ## Author
 
